@@ -18,6 +18,7 @@ from datetime import datetime
 
 from mcp.server.fastmcp import FastMCP
 
+from . import announcements
 from .providers import get_provider
 
 logging.basicConfig(
@@ -241,6 +242,38 @@ async def get_money_supply_data_month(start_date: str = "", end_date: str = "") 
 async def get_money_supply_data_year(start_date: str = "", end_date: str = "") -> dict:
     """Yearly money supply M0/M1/M2 (货币供应量-年). Dates 'YYYY'."""
     return await _run(_provider.get_money_supply_data_year, start_date, end_date)
+
+
+# ====================================================================== #
+# Disclosure announcements (公告) — EastMoney HTTP, not baostock
+# ====================================================================== #
+@mcp.tool()
+async def get_stock_announcements(
+    code: str,
+    start_date: str = "",
+    end_date: str = "",
+    page_size: int = 50,
+    keyword: str = "",
+) -> dict:
+    """List a stock's disclosure announcements (公告) from EastMoney, newest first.
+    `code`: 'sh.600519' / 'sz.002049' / '600519'. `start_date`/`end_date`
+    'YYYY-MM-DD' inclusive filter. `keyword`: substring on title (e.g. '重组').
+    Returns {code, count, data:[{art_code, title, notice_date, type, pdf_url_guess}]}.
+    Pass an art_code to download_stock_announcement to fetch the PDF.
+    Source: EastMoney (reachable outside CN); not baostock."""
+    return await asyncio.to_thread(
+        announcements.list_announcements, code, start_date, end_date, page_size, keyword
+    )
+
+
+@mcp.tool()
+async def download_stock_announcement(art_code: str, save_dir: str = "") -> dict:
+    """Download an announcement's PDF by `art_code` (from get_stock_announcements)
+    to local disk; resolves the real attachment URL via EastMoney's content API.
+    `save_dir` default '~/.cache/ashare-mcp/announcements/'.
+    Returns {art_code, title, save_dir, files:[{path, url, bytes}]} — open the
+    returned `path` with the Read tool (it reads PDFs natively)."""
+    return await asyncio.to_thread(announcements.download_announcement, art_code, save_dir)
 
 
 def main() -> None:
