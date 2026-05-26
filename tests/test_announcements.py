@@ -41,3 +41,13 @@ def test_safe_filename_strips_punctuation_keeps_cjk():
 def test_safe_filename_never_empty():
     assert A._safe("///") == "announcement"
     assert A._safe("") == "announcement"
+
+
+def test_default_dir_honors_env(monkeypatch):
+    monkeypatch.setenv("ASHARE_DOWNLOAD_DIR", "/tmp/some/proj/公告下载")
+    assert A._default_dir() == "/tmp/some/proj/公告下载"
+
+
+def test_default_dir_falls_back_when_env_unset(monkeypatch):
+    monkeypatch.delenv("ASHARE_DOWNLOAD_DIR", raising=False)
+    assert A._default_dir().endswith("/.cache/ashare-mcp/announcements")

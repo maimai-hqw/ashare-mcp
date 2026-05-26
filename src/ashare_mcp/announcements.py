@@ -29,7 +29,14 @@ _HEADERS = {"User-Agent": _UA, "Referer": "https://data.eastmoney.com/"}
 _LIST_API = "https://np-anotice-stock.eastmoney.com/api/security/ann"
 _CONTENT_API = "https://np-cnotice-stock.eastmoney.com/api/content/ann"
 _PDF_FALLBACK = "https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf"
-_DEFAULT_DIR = os.path.expanduser("~/.cache/ashare-mcp/announcements")
+_FALLBACK_DIR = "~/.cache/ashare-mcp/announcements"
+
+
+def _default_dir() -> str:
+    """Default download directory. Set env ``ASHARE_DOWNLOAD_DIR`` (e.g. in the
+    MCP server registration) to redirect downloads into a project folder;
+    otherwise falls back to ~/.cache. An explicit ``save_dir`` arg always wins."""
+    return os.path.expanduser(os.environ.get("ASHARE_DOWNLOAD_DIR") or _FALLBACK_DIR)
 
 
 def _digits(code: str) -> str:
