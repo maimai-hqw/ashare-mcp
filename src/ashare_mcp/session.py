@@ -47,6 +47,11 @@ class BaostockSession:
         self._logged_in = True
         logger.info("baostock logged in")
 
+    def relogin(self) -> None:
+        """Force a fresh login (call after the session expired server-side)."""
+        self._logged_in = False
+        self.ensure_login()
+
     def logout(self) -> None:
         if not self._logged_in:
             return

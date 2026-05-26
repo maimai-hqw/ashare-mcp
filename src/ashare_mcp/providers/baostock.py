@@ -8,6 +8,7 @@ lock (baostock is process-global and not thread-safe).
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import baostock as bs
@@ -16,6 +17,18 @@ from ..codes import normalize_code
 from ..serialize import rs_to_payload
 from ..session import BaostockSession, silence_stdout
 from .base import DataProvider, Payload
+
+logger = logging.getLogger("ashare-mcp")
+
+# baostock error_code returned when the session is gone ("you don't login.").
+_AUTH_ERROR_CODE = "10001001"
+
+
+def _is_auth_error(rs) -> bool:
+    if rs.error_code == "0":
+        return False
+    return rs.error_code == _AUTH_ERROR_CODE or "login" in (rs.error_msg or "").lower()
+
 
 # query_history_k_data_plus exposes different field sets per frequency.
 _K_FIELDS_DAILY = (
@@ -52,10 +65,23 @@ class BaostockProvider(DataProvider):
         self._session = session or BaostockSession()
 
     def _q(self, fn, *args, **kwargs) -> Payload:
-        """Login (idempotent), run a baostock query, normalize the result."""
+        """Login (idempotent), run a baostock query, normalize the result.
+
+        If the session expired server-side (baostock returns "you don't login."),
+        force a fresh login and retry the query once — this recovers a long-idle
+        process without needing a restart.
+        """
         self._session.ensure_login()
         with silence_stdout():
             rs = fn(*args, **kwargs)
+        if _is_auth_error(rs):
+            logger.warning(
+                "baostock session expired (%s: %s); re-login and retry once",
+                rs.error_code, rs.error_msg,
+            )
+            self._session.relogin()
+            with silence_stdout():
+                rs = fn(*args, **kwargs)
         return rs_to_payload(rs)
 
     def close(self) -> None:
