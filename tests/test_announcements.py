@@ -4,6 +4,8 @@ Live API behaviour is covered by manual/integration checks; these guard the
 code-normalization and filename-sanitization logic that must never regress.
 """
 
+import os
+
 import pytest
 
 from ashare_mcp import announcements as A
@@ -51,3 +53,21 @@ def test_default_dir_honors_env(monkeypatch):
 def test_default_dir_falls_back_when_env_unset(monkeypatch):
     monkeypatch.delenv("ASHARE_DOWNLOAD_DIR", raising=False)
     assert A._default_dir().endswith("/.cache/ashare-mcp/announcements")
+
+
+def test_download_resolves_default_dir_without_network(monkeypatch, tmp_path):
+    """Exercises download_announcement's dir-resolution + write path (no network).
+    Guards the _DEFAULT_DIR/_default_dir() rename regression."""
+    monkeypatch.setenv("ASHARE_DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(A, "_resolve_attachments", lambda ac: ("标题:测试", ["https://x/H2_AN_1.pdf"]))
+
+    def _fake_dl(url, path, timeout=60.0):
+        with open(path, "wb") as fh:
+            fh.write(b"%PDF-1.4 test")
+        return 13
+
+    monkeypatch.setattr(A, "_download", _fake_dl)
+    out = A.download_announcement("AN_TEST")
+    assert out["save_dir"] == str(tmp_path)
+    assert out["files"][0]["bytes"] == 13
+    assert os.path.exists(out["files"][0]["path"])

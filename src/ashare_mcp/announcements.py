@@ -160,7 +160,7 @@ def download_announcement(art_code: str, save_dir: str = "") -> dict:
     if not art_code:
         raise ValueError("art_code 不能为空(来自 list_announcements 的返回)")
     title, urls = _resolve_attachments(art_code)
-    save_dir = os.path.expanduser(save_dir) if save_dir else _DEFAULT_DIR
+    save_dir = os.path.expanduser(save_dir) if save_dir else _default_dir()
     os.makedirs(save_dir, exist_ok=True)
     files: list[dict] = []
     for i, url in enumerate(urls, 1):
