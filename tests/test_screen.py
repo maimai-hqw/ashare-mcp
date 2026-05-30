@@ -212,6 +212,16 @@ def test_classify_anomaly_turnaround_and_huge_yield():
     assert screen.classify(_row(pe=10, pb=1.0, div_yield=12.0, roe=10), P) == "anomaly"
 
 
+def test_classify_earnings_spike_is_anomaly_regardless_of_pe():
+    # R2: explosive earnings (np_yoy > npyoy_anomaly) routes to anomaly even when
+    # PE is NOT optically low — the danger is peak/one-off earnings, not a low PE.
+    # Under the OLD rule (np_yoy>300 AND pe<10) this otherwise-healthy row at
+    # pe=14 would have been 'main'.
+    row = _row(name="业绩暴增", pe=14.0, pb=1.5, roe=12.0, np_yoy=400,
+               div_yield=2.0, sector="计算机")
+    assert screen.classify(row, P) == "anomaly"
+
+
 def test_classify_noncyclical_pb_cap_depends_on_roe():
     # roe<12 -> pb cap 2.5: pb 2.8 rejects.
     assert screen.classify(_row(pe=15, pb=2.8, roe=10), P) == "reject"
@@ -227,6 +237,13 @@ def test_percentile_helper_basics():
     assert screen._pctrank(4.0, vals) == 1.0   # max -> 1
     assert screen._pctrank(1.0, vals) == 0.0   # min -> 0
     assert screen._pctrank(None, vals) == 0.5  # missing -> neutral
+
+
+def test_percentile_helper_clamps_out_of_range_values():
+    # R3: a non-member value above the pool max must clamp to 1.0 (not 1.5), and
+    # below the pool min must clamp to 0.0 (not negative).
+    assert screen._pctrank(10.0, [1.0, 2.0, 3.0]) == 1.0
+    assert screen._pctrank(0.0, [1.0, 2.0, 3.0]) == 0.0
 
 
 def test_rank_caps_sector_to_eight_and_sorts_desc():

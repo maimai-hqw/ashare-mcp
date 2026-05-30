@@ -232,8 +232,7 @@ DEFAULTS: dict = {
     "pe_for_lo_roe": 12.0,      # 低ROE救援所需 PE 上限
     # anomaly isolation
     "anom_pb": 0.4,             # 破净异常阈值
-    "anom_np_yoy": 300.0,       # 业绩暴增阈值(%)
-    "anom_np_pe": 10.0,         # 业绩暴增需配合的低 PE
+    "npyoy_anomaly": 300.0,     # 业绩暴增阈值(%)——超过即隔离,不再附加 PE 条件
     "anom_div": 10.0,           # 超高股息异常阈值(%)
     # cyclical sectors
     "cyc_pb_max": 1.2,
@@ -287,13 +286,20 @@ def classify(row: dict, params: dict) -> str:
         return "reject"
     if mktcap is None or mktcap < p["min_mktcap_yi"]:
         return "reject"
+    # Loss-makers (PE <= 0) are INTENTIONALLY rejected here (neither anomaly nor
+    # main): this is a quality+value funnel, and deep-cyclical / turnaround /
+    # loss-maker cases are deferred to the deep-analysis stage. The valuation-band
+    # gate below (0 < pe via pe_min) also enforces this for non-cyclicals; the
+    # cyclical branch's cyc_pe_min keeps it consistent there too.
 
     # --- anomaly isolation (pull odd shapes out before normal scoring) -
     if (0 < pe < p["pe_min"]):
         return "anomaly"
     if pb < p["anom_pb"]:
         return "anomaly"
-    if (np_yoy is not None and np_yoy > p["anom_np_yoy"] and pe < p["anom_np_pe"]):
+    # Explosive earnings is isolated REGARDLESS of PE: the danger is peak/one-off
+    # earnings (a possibly unrepeatable spike), not merely a low optical PE.
+    if (np_yoy is not None and np_yoy > p["npyoy_anomaly"]):
         return "anomaly"
     if (div is not None and div > p["anom_div"]):
         return "anomaly"
@@ -342,7 +348,10 @@ def _pctrank(value, values: list[float]) -> float:
     # rank-based percentile: count strictly below / (n-1) -> min maps to 0,
     # max maps to 1, ties share the same rank.
     n_below = sum(1 for v in pool if v < value)
-    return n_below / (len(pool) - 1)
+    rank = n_below / (len(pool) - 1)
+    # Clamp: a non-member value above the pool max (n_below == len) would yield
+    # > 1; below the min yields < 0. Keep the percentile in [0, 1].
+    return 0.0 if rank < 0 else (1.0 if rank > 1 else rank)
 
 
 def _inv(x):
