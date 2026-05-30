@@ -114,10 +114,10 @@ def _annual_factor(report_period=None, today: date | None = None) -> float:
                 months = (n // 100) % 100
     if months in _MONTHS_FACTOR:
         return _MONTHS_FACTOR[months]
-    if months is not None:
-        # Non-quarter-end month (unexpected); annualize by elapsed months, clamped.
-        m = months if 1 <= months <= 12 else 12
-        return 12.0 / m
+    # A month outside {3,6,9,12} extracted from f221 is a malformed / non-periodic
+    # report date (real A-share periodic reports end ONLY on quarter ends). Do NOT
+    # trust it — a month like 04 would silently scale ROE by 12/4 = 3x. Fall
+    # through to the calendar-inferred factor below instead of guessing 12/m.
 
     d = today or datetime.now().date()
     md = (d.month, d.day)

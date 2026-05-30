@@ -99,6 +99,10 @@ def test_annual_factor_from_report_period():
     # absent/0 report period -> falls back to the calendar
     assert screen._annual_factor(report_period=0, today=date(2026, 6, 15)) == 4.0
     assert screen._annual_factor(report_period=None, today=date(2026, 9, 15)) == 2.0
+    # malformed / non-quarter-end month (e.g. 20260430) is NOT trusted: it falls
+    # through to the calendar factor, never the dangerous 12/4=3x guess.
+    assert screen._annual_factor(report_period="20260430", today=date(2026, 6, 15)) == 4.0
+    assert screen._annual_factor(report_period="20260430", today=date(2026, 9, 15)) == 2.0
 
 
 def test_annualize_roe_uses_per_row_period():
