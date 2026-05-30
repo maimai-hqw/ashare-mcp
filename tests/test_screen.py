@@ -351,3 +351,30 @@ def test_run_screen_overrides_drop_none_and_merge(monkeypatch):
     assert out["params"]["pe_max"] == screen.DEFAULTS["pe_max"]
     assert out["main_count"] == 0 and out["anomaly_count"] == 0
     assert out["candidates"] == [] and out["anomaly_pool"] == []
+
+
+# ---------------------------------------------------------------------- #
+# fetch_universe — dedup safety net (pure, _get_json stubbed)
+# ---------------------------------------------------------------------- #
+def test_fetch_universe_dedups_and_terminates_without_total(monkeypatch):
+    # R9: a proxy that ignores `pn` and re-serves the SAME 100 codes every page,
+    # and omits `total`, must yield 100 unique rows (not 300) and not loop forever.
+    same_page = {
+        "data": {
+            # no "total" key on purpose
+            "diff": {str(i): {"f12": f"{600000 + i}", "f14": f"股票{i}"}
+                     for i in range(100)},
+        }
+    }
+    calls = {"n": 0}
+
+    def fake_get_json(url, timeout=20.0):
+        calls["n"] += 1
+        return same_page
+
+    monkeypatch.setattr(screen, "_get_json", fake_get_json)
+    rows = screen.fetch_universe(page_size=100, max_pages=100)
+    assert len(rows) == 100
+    assert len({r["code"] for r in rows}) == 100
+    # page 1 adds 100; page 2 adds 0 new -> break. So exactly 2 fetches.
+    assert calls["n"] == 2

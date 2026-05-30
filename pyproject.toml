@@ -26,5 +26,5 @@ dev = [
 
 [tool.pytest.ini_options]
 markers = [
-    "network: integration tests that require live baostock connectivity",
+    "network: integration tests that require live network access (baostock or EastMoney)",
 ]

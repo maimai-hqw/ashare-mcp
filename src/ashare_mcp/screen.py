@@ -174,6 +174,7 @@ def fetch_universe(page_size: int = 100, max_pages: int = 100) -> list[dict]:
     floats or None (never raises on a missing/"-"/None field).
     """
     rows: list[dict] = []
+    seen: set[str] = set()
     page = 1
     while page <= max_pages:
         qs = urllib.parse.urlencode({
@@ -195,9 +196,14 @@ def fetch_universe(page_size: int = 100, max_pages: int = 100) -> list[dict]:
             if not isinstance(it, dict):
                 continue
             row = _map_row(it)
-            if row is not None:
+            # Dedup safety net: one row per code even if EastMoney drops `total`
+            # or a proxy ignores `pn` and re-serves the same page.
+            if row is not None and row["code"] not in seen:
+                seen.add(row["code"])
                 rows.append(row)
                 added += 1
+        # If a page contributed ZERO new codes, we are looping on stale data ->
+        # stop (bounds the result and prevents an infinite loop).
         if added == 0:
             break
         total = data.get("total")
