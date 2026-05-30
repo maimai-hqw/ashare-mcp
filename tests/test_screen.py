@@ -203,3 +203,49 @@ def test_rank_truncates_total_cap():
     assert len(out) == P["total_cap"] == 120
     scores = [c["score"] for c in out]
     assert scores == sorted(scores, reverse=True)
+
+
+# ---------------------------------------------------------------------- #
+# Task 4 — run_screen (pure, fetch_universe monkeypatched)
+# ---------------------------------------------------------------------- #
+def test_run_screen_splits_main_and_anomaly(monkeypatch):
+    # roe here is RAW QUARTERLY f37 (run_screen annualizes x4 before classify).
+    fake = [
+        # main: annual roe 12, in band, big enough
+        _row(code="600001", name="优质龙头", sector="计算机", pe=10.0,
+             pb=1.2, roe=3.0, div_yield=2.0, price=10.0, mktcap_yi=100.0),
+        # anomaly: ultra-low PE
+        _row(code="600002", name="超低市盈", sector="机械", pe=1.1,
+             pb=0.9, roe=3.0, div_yield=1.0, price=8.0, mktcap_yi=80.0),
+        # reject: ST name
+        _row(code="600003", name="ST困境", sector="计算机", pe=10.0,
+             pb=1.0, roe=3.0, div_yield=2.0, price=6.0, mktcap_yi=60.0),
+        # anomaly: 超高股息
+        _row(code="600004", name="高股息", sector="银行", pe=8.0,
+             pb=1.0, roe=3.0, div_yield=12.0, price=5.0, mktcap_yi=200.0),
+    ]
+    monkeypatch.setattr(screen, "fetch_universe", lambda *a, **k: list(fake))
+    out = screen.run_screen()
+    assert out["main_count"] == 1
+    assert out["anomaly_count"] == 2
+    assert len(out["candidates"]) == 1
+    assert out["candidates"][0]["code"] == "600001"
+    assert len(out["anomaly_pool"]) == 2
+    anom_codes = {r["code"] for r in out["anomaly_pool"]}
+    assert anom_codes == {"600002", "600004"}
+    # params echo includes overridable defaults
+    assert out["params"]["roe_min"] == screen.DEFAULTS["roe_min"]
+    # every surviving candidate carries a score
+    assert "score" in out["candidates"][0]
+
+
+def test_run_screen_overrides_drop_none_and_merge(monkeypatch):
+    monkeypatch.setattr(screen, "fetch_universe", lambda *a, **k: [])
+    out = screen.run_screen(roe_min=9, pe_max=None, min_mktcap_yi=80)
+    # explicit override applied
+    assert out["params"]["roe_min"] == 9
+    assert out["params"]["min_mktcap_yi"] == 80
+    # None override dropped -> default retained
+    assert out["params"]["pe_max"] == screen.DEFAULTS["pe_max"]
+    assert out["main_count"] == 0 and out["anomaly_count"] == 0
+    assert out["candidates"] == [] and out["anomaly_pool"] == []

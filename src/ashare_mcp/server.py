@@ -19,6 +19,7 @@ from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 
 from . import announcements
+from . import screen
 from .providers import get_provider
 
 logging.basicConfig(
@@ -274,6 +275,51 @@ async def download_stock_announcement(art_code: str, save_dir: str = "") -> dict
     Returns {art_code, title, save_dir, files:[{path, url, bytes}]} — open the
     returned `path` with the Read tool (it reads PDFs natively)."""
     return await asyncio.to_thread(announcements.download_announcement, art_code, save_dir)
+
+
+# ====================================================================== #
+# Value-hunt 市场初筛 (screen) — EastMoney 截面, not baostock
+# ====================================================================== #
+@mcp.tool()
+async def screen_market(
+    pe_min: float = 4,
+    pe_max: float = 25,
+    pb_max: float = 2.5,
+    roe_min: float = 7,
+    min_mktcap_yi: float = 50,
+    min_price: float = 3,
+    per_industry_cap: int = 8,
+    total_cap: int = 120,
+) -> dict:
+    """价值投资市场初筛:一次性拉取全 A 股截面(东财行情),硬过滤 + 异常隔离 +
+    强周期行业特判 + 行业内综合打分排序,产出主仓候选池与异常观察池。
+
+    参数(均为年化口径阈值,留空用默认值):
+      pe_min/pe_max: 非周期股 PE 区间(默认 4~25)。
+      pb_max: ROE 偏低时的 PB 上限(默认 2.5;ROE≥12 时放宽到 3.0)。
+      roe_min: 主仓 ROE 年化下限(默认 7;5~7 之间需高股息+低 PE 救援)。
+      min_mktcap_yi: 总市值下限(亿,默认 50,剔除微盘)。
+      min_price: 股价下限(默认 3,剔除仙股)。
+      per_industry_cap: 每个一级行业最多保留的候选数(默认 8)。
+      total_cap: 全市场候选总数上限(默认 120)。
+
+    异常池单列(不计入主仓评分):极低 PE(0<PE<pe_min)、深度破净(PB<0.4)、
+    业绩暴增配低 PE、超高股息(>10%)——这些需人工甄别真假便宜。
+    返回 {candidates, anomaly_pool, params, main_count, anomaly_count};
+    candidates 每条含 score(0~100,越高越便宜/越优)。
+    注:ROE 源字段 f37 为单季口径,内部已年化(×4)再与上述阈值比较。
+    数据源:东财(中国大陆外可达),非 baostock。"""
+    return await asyncio.to_thread(
+        screen.run_screen,
+        pe_min=pe_min,
+        pe_max=pe_max,
+        pb_max=pb_max,
+        roe_min=roe_min,
+        min_mktcap_yi=min_mktcap_yi,
+        min_price=min_price,
+        per_industry_cap=per_industry_cap,
+        total_cap=total_cap,
+    )
 
 
 def main() -> None:

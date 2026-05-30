@@ -322,3 +322,50 @@ def rank_candidates(rows: list[dict], params: dict) -> list[dict]:
 
     kept.sort(key=lambda r: r["score"], reverse=True)
     return kept[: p["total_cap"]]
+
+
+# ====================================================================== #
+# Task 4 — run_screen (orchestration)
+# ====================================================================== #
+def _annualize_roe(row: dict) -> dict:
+    """Return a shallow copy of ``row`` with ``roe`` converted from the raw
+    quarterly f37 to an annual-equivalent (x4) when ROE_IS_QUARTERLY, so it can
+    be compared against the annual thresholds in DEFAULTS. The raw quarterly
+    figure is preserved under ``roe_q`` for transparency."""
+    out = dict(row)
+    q = row.get("roe")
+    out["roe_q"] = q
+    if ROE_IS_QUARTERLY and q is not None:
+        out["roe"] = q * 4.0
+    return out
+
+
+def run_screen(**overrides) -> dict:
+    """Run the full value-hunt screen over the live A-share cross-section.
+
+    Pulls the universe, hard-filters / isolates anomalies / ranks the main
+    candidates. ``overrides`` are merged over DEFAULTS (None values dropped).
+    Returns {candidates, anomaly_pool, params, main_count, anomaly_count}.
+    """
+    params = dict(DEFAULTS)
+    params.update({k: v for k, v in overrides.items() if v is not None})
+
+    rows = [_annualize_roe(r) for r in fetch_universe()]
+
+    main_rows: list[dict] = []
+    anomaly_pool: list[dict] = []
+    for r in rows:
+        bucket = classify(r, params)
+        if bucket == "main":
+            main_rows.append(r)
+        elif bucket == "anomaly":
+            anomaly_pool.append(r)
+
+    candidates = rank_candidates(main_rows, params)
+    return {
+        "candidates": candidates,
+        "anomaly_pool": anomaly_pool,
+        "params": params,
+        "main_count": len(main_rows),
+        "anomaly_count": len(anomaly_pool),
+    }
