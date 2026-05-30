@@ -19,6 +19,7 @@ from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 
 from . import announcements
+from . import quotes
 from . import screen
 from .providers import get_provider
 
@@ -326,6 +327,18 @@ async def screen_market(
         per_industry_cap=per_industry_cap,
         total_cap=total_cap,
     )
+
+
+# ====================================================================== #
+# Batch realtime-snapshot quotes — EastMoney/Tencent HTTP, not baostock
+# ====================================================================== #
+@mcp.tool()
+async def get_quotes(codes: str) -> dict:
+    """批量实时快照行情(东财 push2delay 批量,腾讯 fallback;不依赖 baostock)。
+    codes: 逗号/空格分隔的代码,如 'sh.600018,sz.301498,600332'(支持 sh./sz./bj./纯6位)。
+    返回每只 {code,name,price,prev_close,open,high,low,pct_chg,volume,amount,pe_ttm,pb,mktcap_yi,turnover,halted}。
+    用于刷新现价对照纪律触发档;一次调用取全部代码。"""
+    return await _run(quotes.fetch_quotes, codes)
 
 
 def main() -> None:
