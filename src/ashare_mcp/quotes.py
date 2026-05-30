@@ -13,6 +13,11 @@ mirroring ``announcements.py`` / ``screen.py``):
   * FALLBACK — Tencent ``qt.gtimg.cn`` (proven reachable from US), GBK-encoded,
                one call for all codes.
 
+Fallback is a PER-CODE merge, not all-or-nothing: any code EastMoney did not
+price (never returned, or returned halted with price=None) is filled from
+Tencent. ``source`` is ``eastmoney`` / ``tencent`` / ``eastmoney+tencent`` per
+which backend(s) actually carried data.
+
 SCALING (LIVE-PROBED 2026-05-29/30): unlike ``screen.py``'s clist call, this
 ulist call passes ``fltt=2`` and EastMoney then returns f2/f3/f9/f23/... as
 ALREADY-DECIMAL floats (price 5.13, PE 7.45, PB 0.82, pct_chg 2.19) — NOT the
@@ -83,6 +88,17 @@ def _scaled(v, factor: float) -> float | None:
     """_num(v) / factor, propagating None."""
     n = _num(v)
     return None if n is None else n / factor
+
+
+def _pos(v) -> float | None:
+    """Parse a PRICE-like cell, mapping a non-positive value (0 / negative) to
+    None. A halted/suspended stock often reports a 0.0 price (and 0.0 OHLC) on
+    both feeds; surfacing that as 0.0 is dangerous — it could falsely trip a
+    stop-loss / add-zone trigger downstream. Map any price <= 0 to None so a
+    halted name is unambiguously 'no price', never a fake 0.
+    """
+    n = _num(v)
+    return None if (n is None or n <= 0.0) else n
 
 
 # ---------------------------------------------------------------------- #
@@ -203,16 +219,17 @@ def _parse_eastmoney(obj: dict) -> tuple[list[dict], str]:
                 as_of = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
             except (OverflowError, OSError, ValueError):
                 as_of = ""
-        price = _num(it.get("f2"))
+        # fltt=2 -> already decimal; NO /100 (see module docstring). A halted
+        # stock reports 0.0 prices -> _pos maps non-positive to None.
+        price = _pos(it.get("f2"))
         rows.append({
             "code": _em_canonical(num, it.get("f13")),
             "name": (it.get("f14") or "").strip(),
-            # fltt=2 -> already decimal; NO /100 (see module docstring).
             "price": price,
-            "prev_close": _num(it.get("f18")),
-            "open": _num(it.get("f17")),
-            "high": _num(it.get("f15")),
-            "low": _num(it.get("f16")),
+            "prev_close": _pos(it.get("f18")),
+            "open": _pos(it.get("f17")),
+            "high": _pos(it.get("f15")),
+            "low": _pos(it.get("f16")),
             "pct_chg": _num(it.get("f3")),
             "volume": _num(it.get("f5")),
             "amount": _num(it.get("f6")),
@@ -263,7 +280,8 @@ def _parse_tencent(text: str) -> tuple[list[dict], str]:
         key = line.split("=", 1)[0][2:]  # drop "v_"
         m = re.match(r"^(sh|sz|bj)(\d{6})$", key)
         code = f"{m.group(1)}.{m.group(2)}" if m else key
-        price = _num(at(3))
+        # Halted stock reports 0.00 prices -> _pos maps non-positive to None.
+        price = _pos(at(3))
         ts = (at(30) or "").strip()
         if ts and not as_of:
             as_of = ts
@@ -272,10 +290,10 @@ def _parse_tencent(text: str) -> tuple[list[dict], str]:
             "code": code,
             "name": (at(1) or "").strip(),
             "price": price,
-            "prev_close": _num(at(4)),
-            "open": _num(at(5)),
-            "high": _num(at(33)),
-            "low": _num(at(34)),
+            "prev_close": _pos(at(4)),
+            "open": _pos(at(5)),
+            "high": _pos(at(33)),
+            "low": _pos(at(34)),
             "pct_chg": _num(at(32)),
             "volume": _num(at(6)),
             # 万元 -> 元 to match EastMoney's amount unit.
@@ -284,7 +302,7 @@ def _parse_tencent(text: str) -> tuple[list[dict], str]:
             "pb": _num(at(46)),
             "mktcap_yi": _num(at(45)),
             "turnover": _num(at(38)),
-            "halted": price is None or price == 0.0,
+            "halted": price is None,
         })
     return rows, as_of
 
@@ -327,60 +345,103 @@ def fetch_quotes(codes) -> dict:
     forms ``sh.600018`` / ``sz.301498`` / ``bj.430047`` / ``600018`` / ``sh600018``.
 
     Tries EastMoney ulist (one batch call); if it raises / returns empty /
-    returns far fewer rows than requested, falls back to Tencent (one batch
-    call). Returns::
+    leaves any requested code WITHOUT a price, fills the remaining gaps from
+    Tencent (one batch call) — per-code merge, not all-or-nothing. Returns::
 
-        {"count": N, "source": "eastmoney"|"tencent", "as_of": "<str>",
+        {"count": N, "source": "eastmoney"|"tencent"|"eastmoney+tencent",
+         "as_of": "<str>",
          "data": [{"code","name","price","prev_close","open","high","low",
                    "pct_chg","volume","amount","pe_ttm","pb","mktcap_yi",
                    "turnover","halted"}, ...]}
 
-    Order matches the (deduped) input order. Every value is a float or None;
-    a halted/missing/unknown code still appears with price=None (and a ``note``
-    if the feed never returned it). One bad code never breaks the batch.
+    Output order matches the ORIGINAL input token order (bad codes included, in
+    place). Codes are deduped (first occurrence wins its position). Every value
+    is a float or None; a halted/missing/unknown code still appears with
+    price=None (and a ``note`` if no feed returned it / it was un-parseable).
+    One bad code never breaks the batch.
     """
-    # Normalize + dedupe, preserving first-seen order. Un-parseable tokens are
-    # surfaced as bad-code placeholder rows rather than crashing the batch.
-    canon: list[str] = []
+    # Build an ordered list of (token, canonical-or-None) preserving the original
+    # input order and deduping canonical codes. Un-parseable tokens carry a None
+    # canonical and become a bad-placeholder row IN PLACE (order preserved).
+    ordered: list[tuple[str, str | None]] = []
     seen: set[str] = set()
-    bad: list[str] = []
+    canon: list[str] = []
     for tok in _split_codes(codes):
         try:
             c = _norm(tok)
         except ValueError:
-            if tok not in bad:
-                bad.append(tok)
+            ordered.append((tok, None))  # bad code, in its original position
             continue
-        if c not in seen:
-            seen.add(c)
-            canon.append(c)
+        if c in seen:
+            continue  # duplicate canonical -> keep only the first occurrence
+        seen.add(c)
+        canon.append(c)
+        ordered.append((tok, c))
 
-    source = "eastmoney"
-    as_of = ""
-    by_code: dict[str, dict] = {}
+    # Fetch EastMoney (primary), then merge Tencent into any per-code GAP (a code
+    # EM never returned, or returned without a price). This fills complementary
+    # partial coverage instead of replacing wholesale.
+    em_by_code: dict[str, dict] = {}
+    tx_by_code: dict[str, dict] = {}
+    em_as_of = ""
+    tx_as_of = ""
     if canon:
-        rows: list[dict] = []
         try:
-            rows, as_of = _fetch_eastmoney(canon)
+            em_rows, em_as_of = _fetch_eastmoney(canon)
         except Exception:
-            rows = []
-        # Fall back when EastMoney raised, returned nothing, or returned far
-        # fewer rows than asked (a flaky/partial response).
-        if len(rows) < max(1, (len(canon) + 1) // 2):
+            em_rows = []
+        for r in em_rows:
+            em_by_code.setdefault(r["code"], r)
+        # A code is "covered" only if EM gave it a usable (non-None) price.
+        missing = [c for c in canon
+                   if em_by_code.get(c) is None or em_by_code[c]["price"] is None]
+        if missing:
             try:
-                t_rows, t_as_of = _fetch_tencent(canon)
+                tx_rows, tx_as_of = _fetch_tencent(canon)
             except Exception:
-                t_rows, t_as_of = [], ""
-            if len(t_rows) > len(rows):
-                rows, as_of, source = t_rows, t_as_of, "tencent"
-        for r in rows:
-            by_code.setdefault(r["code"], r)
+                tx_rows = []
+            for r in tx_rows:
+                tx_by_code.setdefault(r["code"], r)
 
-    # Re-order to match input; fill never-returned codes with a placeholder.
-    data: list[dict] = []
+    # Per-code merge: prefer EM if it priced the code, else Tencent if it did,
+    # else whatever EM/Tencent returned (price None) for a halted name, else a
+    # never-returned placeholder. Track which backend(s) actually contributed.
+    used_em = False
+    used_tx = False
+    merged: dict[str, dict] = {}
     for c in canon:
-        data.append(by_code.get(c) or _empty_row(c, "未返回行情(代码可能无效或停牌)"))
-    for tok in bad:
-        data.append(_empty_row(tok, "无法解析的代码"))
+        em = em_by_code.get(c)
+        tx = tx_by_code.get(c)
+        if em is not None and em["price"] is not None:
+            merged[c] = em
+            used_em = True
+        elif tx is not None and tx["price"] is not None:
+            merged[c] = tx
+            used_tx = True
+        elif em is not None:
+            merged[c] = em            # EM returned it (e.g. halted, price None)
+            used_em = True
+        elif tx is not None:
+            merged[c] = tx            # Tencent returned it (halted, price None)
+            used_tx = True
+        else:
+            merged[c] = _empty_row(c, "未返回行情(代码可能无效或停牌)")
+
+    if used_em and used_tx:
+        source = "eastmoney+tencent"
+    elif used_tx:
+        source = "tencent"
+    else:
+        source = "eastmoney"
+    # Prefer the backend that actually carried the data for as_of.
+    as_of = em_as_of if used_em else (tx_as_of or em_as_of)
+
+    # Render in ORIGINAL input token order; bad codes appear in place.
+    data: list[dict] = []
+    for tok, c in ordered:
+        if c is None:
+            data.append(_empty_row(tok, "无法解析的代码"))
+        else:
+            data.append(merged[c])
 
     return {"count": len(data), "source": source, "as_of": as_of, "data": data}

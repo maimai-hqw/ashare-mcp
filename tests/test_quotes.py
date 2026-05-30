@@ -213,13 +213,43 @@ def test_parse_tencent_maps_rows_and_units():
     assert b["mktcap_yi"] == pytest.approx(16576.08, abs=0.01)
 
 
-def test_parse_tencent_halted_zero_price():
-    # bj.430047 was halted in the live probe (price 0.00) -> halted True.
+def test_parse_tencent_halted_zero_price_is_none():
+    # bj.430047 was halted in the live probe (price 0.00). A 0.0 price is
+    # dangerous downstream (could trip a stop-loss), so it must map to None.
+    # open ([5]) and high ([33]) are also 0 here -> None too.
     halted = 'v_bj430047="62~诺思兰德~430047~0.00~8.17~0.00~0~0~0~";'
     rows, _ = quotes._parse_tencent(halted)
     assert rows[0]["code"] == "bj.430047"
-    assert rows[0]["price"] == 0.0
+    assert rows[0]["price"] is None
+    assert rows[0]["open"] is None
+    assert rows[0]["prev_close"] == 8.17   # a real non-zero field stays
     assert rows[0]["halted"] is True
+
+
+def test_parse_eastmoney_zero_price_is_none():
+    # EastMoney can report a numeric 0 price for a halted/suspended stock; 0.0
+    # must map to None (not a fake price), and halted must be True.
+    sample = {"data": {"diff": [{"f12": "600018", "f13": 1, "f14": "上港集团",
+                                 "f2": 0, "f17": 0, "f18": 5.02}]}}
+    rows, _ = quotes._parse_eastmoney(sample)
+    assert rows[0]["price"] is None
+    assert rows[0]["open"] is None
+    assert rows[0]["prev_close"] == 5.02
+    assert rows[0]["halted"] is True
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (5.13, 5.13),
+    ("1326.00", 1326.0),
+    (0, None),       # halted -> None
+    (0.0, None),
+    ("0.00", None),
+    (-1.5, None),    # negative -> None
+    ("-", None),
+    (None, None),
+])
+def test_pos_maps_nonpositive_to_none(raw, expected):
+    assert quotes._pos(raw) == expected
 
 
 # ---------------------------------------------------------------------- #
@@ -302,6 +332,63 @@ def test_fetch_quotes_accepts_list_input(monkeypatch):
     assert [r["code"] for r in out["data"]] == ["sh.600018", "sz.301498"]
 
 
+def test_fetch_quotes_complementary_partial_coverage_merges(monkeypatch):
+    # EastMoney prices ONLY 600018; Tencent prices ONLY 600519. The merge must
+    # fill the per-code GAP from Tencent rather than discarding it. source is
+    # "eastmoney+tencent" since BOTH backends contributed a priced row.
+    monkeypatch.setattr(quotes, "_get_json", lambda url, timeout=20.0: {
+        "data": {"diff": [_EM_SAMPLE["data"]["diff"][0]]}})  # 600018 only
+    monkeypatch.setattr(quotes, "_get_text_gbk",
+                        lambda url, timeout=20.0: _TENCENT_SH600519)  # 600519 only
+    out = quotes.fetch_quotes("sh.600018,sh.600519")
+    assert out["source"] == "eastmoney+tencent"
+    by = {r["code"]: r for r in out["data"]}
+    assert by["sh.600018"]["price"] == 5.13     # from EastMoney
+    assert by["sh.600519"]["price"] == 1326.0   # filled from Tencent
+    assert out["count"] == 2
+
+
+def test_fetch_quotes_eastmoney_complete_skips_tencent(monkeypatch):
+    # EastMoney prices everything -> Tencent must not even be consulted, and
+    # source stays "eastmoney".
+    monkeypatch.setattr(quotes, "_get_json", lambda url, timeout=20.0: _EM_SAMPLE)
+    def must_not_call(url, timeout=20.0):
+        raise AssertionError("Tencent should not be called when EM is complete")
+    monkeypatch.setattr(quotes, "_get_text_gbk", must_not_call)
+    out = quotes.fetch_quotes("sh.600018,sz.301498")
+    assert out["source"] == "eastmoney"
+    assert all(r["price"] is not None for r in out["data"])
+
+
+def test_fetch_quotes_em_halted_filled_by_tencent(monkeypatch):
+    # EastMoney returns 600519 but HALTED (price None); Tencent has it priced ->
+    # the priced Tencent row wins for that code (gap = no usable price).
+    em_halted = dict(_EM_SAMPLE["data"]["diff"][0])  # 600018 priced
+    em_halted2 = {"f12": "600519", "f13": 1, "f14": "贵州茅台", "f2": 0}  # halted
+    monkeypatch.setattr(quotes, "_get_json", lambda url, timeout=20.0: {
+        "data": {"diff": [em_halted, em_halted2]}})
+    monkeypatch.setattr(quotes, "_get_text_gbk",
+                        lambda url, timeout=20.0: _TENCENT_SH600519)
+    out = quotes.fetch_quotes("sh.600018,sh.600519")
+    by = {r["code"]: r for r in out["data"]}
+    assert by["sh.600018"]["price"] == 5.13
+    assert by["sh.600519"]["price"] == 1326.0   # EM halted -> Tencent fills
+    assert out["source"] == "eastmoney+tencent"
+
+
+def test_fetch_quotes_mixed_valid_bad_preserves_input_order(monkeypatch):
+    # A bad code in the MIDDLE must appear in its original position, not shoved
+    # to the end.
+    monkeypatch.setattr(quotes, "_get_json", lambda url, timeout=20.0: _EM_SAMPLE)
+    out = quotes.fetch_quotes("sh.600018, NOTACODE, sz.301498")
+    codes = [r["code"] for r in out["data"]]
+    assert codes == ["sh.600018", "NOTACODE", "sz.301498"]  # order preserved
+    by = {r["code"]: r for r in out["data"]}
+    assert by["NOTACODE"]["price"] is None and "note" in by["NOTACODE"]
+    assert by["sh.600018"]["price"] == 5.13
+    assert by["sz.301498"]["price"] == 44.28
+
+
 # ---------------------------------------------------------------------- #
 # Network smoke (marked) — real feeds, baostock-independent
 # ---------------------------------------------------------------------- #
@@ -312,7 +399,7 @@ def test_fetch_quotes_live_smoke():
     for r in out["data"]:
         print(r["code"], r["name"], r["price"], r["pct_chg"],
               "PE", r["pe_ttm"], "PB", r["pb"], "mktcap亿", r["mktcap_yi"])
-    assert out["source"] in ("eastmoney", "tencent")
+    assert out["source"] in ("eastmoney", "tencent", "eastmoney+tencent")
     priced = [r for r in out["data"] if r["price"] and r["price"] > 0]
     assert len(priced) >= 2
     # confirm baostock was never imported by this module
