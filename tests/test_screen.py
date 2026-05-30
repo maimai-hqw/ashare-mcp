@@ -153,3 +153,53 @@ def test_classify_noncyclical_pb_cap_depends_on_roe():
     assert screen.classify(_row(pe=15, pb=2.8, roe=10), P) == "reject"
     # roe>=12 -> pb cap 3.0: pb 2.8 OK.
     assert screen.classify(_row(pe=15, pb=2.8, roe=14), P) == "main"
+
+
+# ---------------------------------------------------------------------- #
+# Task 3 — rank_candidates (pure)
+# ---------------------------------------------------------------------- #
+def test_percentile_helper_basics():
+    vals = [1.0, 2.0, 3.0, 4.0]
+    assert screen._pctrank(4.0, vals) == 1.0   # max -> 1
+    assert screen._pctrank(1.0, vals) == 0.0   # min -> 0
+    assert screen._pctrank(None, vals) == 0.5  # missing -> neutral
+
+
+def test_rank_caps_sector_to_eight_and_sorts_desc():
+    # 12 same-sector main rows, identical except PE -> cheaper should win.
+    rows = []
+    for i in range(12):
+        rows.append(_row(code=f"{600000 + i}", sector="计算机",
+                         pe=5.0 + i, pb=1.5, roe=12.0, div_yield=2.0,
+                         rev_yoy=5.0))
+    out = screen.rank_candidates(rows, P)
+    assert len(out) <= P["per_industry_cap"] == 8
+    scores = [c["score"] for c in out]
+    assert scores == sorted(scores, reverse=True)
+    # cheapest PE (lowest pe) should be the top-ranked survivor.
+    assert out[0]["pe"] == 5.0
+
+
+def test_rank_cheaper_scores_higher_all_else_equal():
+    a = _row(code="000001", sector="银行", pe=6.0, pb=1.0, roe=12.0,
+             div_yield=4.0, rev_yoy=5.0)
+    b = _row(code="000002", sector="银行", pe=12.0, pb=1.0, roe=12.0,
+             div_yield=4.0, rev_yoy=5.0)
+    out = screen.rank_candidates([a, b], P)
+    by_code = {c["code"]: c for c in out}
+    assert by_code["000001"]["score"] > by_code["000002"]["score"]
+
+
+def test_rank_truncates_total_cap():
+    # Many sectors, many rows -> global truncation to total_cap.
+    rows = []
+    for s in range(40):
+        for i in range(10):
+            rows.append(_row(code=f"{500000 + s*100 + i}", sector=f"行业{s}",
+                             pe=5.0 + i, pb=1.2, roe=12.0, div_yield=3.0,
+                             rev_yoy=4.0))
+    out = screen.rank_candidates(rows, P)
+    # 40 sectors * min(10,8)=8 = 320 pre-truncation -> capped at total_cap.
+    assert len(out) == P["total_cap"] == 120
+    scores = [c["score"] for c in out]
+    assert scores == sorted(scores, reverse=True)

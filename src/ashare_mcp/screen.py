@@ -172,6 +172,9 @@ DEFAULTS: dict = {
     "cyc_div_min": 3.5,
     "cyc_pe_min": 4.0,
     "cyc_pe_max": 15.0,
+    # ranking caps
+    "per_industry_cap": 8,
+    "total_cap": 120,
 }
 
 # 强周期一级行业(子串匹配 EastMoney f100 一级行业名)
@@ -249,3 +252,73 @@ def classify(row: dict, params: dict) -> str:
             and pe <= p["pe_for_lo_roe"]):
         return "main"
     return "reject"
+
+
+# ====================================================================== #
+# Task 3 — rank_candidates
+# ====================================================================== #
+def _pctrank(value, values: list[float]) -> float:
+    """Percentile rank of ``value`` within ``values`` in [0, 1] (bigger value ->
+    bigger rank). ``None`` (missing metric) -> 0.5 neutral so it neither helps
+    nor hurts. Empty/degenerate population -> 0.5."""
+    if value is None:
+        return 0.5
+    pool = [v for v in values if v is not None]
+    if not pool:
+        return 0.5
+    lo = min(pool)
+    hi = max(pool)
+    if hi == lo:
+        return 0.5
+    # rank-based percentile: count strictly below / (n-1) -> min maps to 0,
+    # max maps to 1, ties share the same rank.
+    n_below = sum(1 for v in pool if v < value)
+    return n_below / (len(pool) - 1)
+
+
+def _inv(x):
+    """1/x for positive x; None for None/non-positive (cheaper -> larger)."""
+    if x is None or x <= 0:
+        return None
+    return 1.0 / x
+
+
+def _score_sector(rows: list[dict]) -> None:
+    """Compute and attach a composite ``score`` (0..100) to each row, ranked
+    within this sector group. Higher is cheaper/better."""
+    inv_pe = [_inv(r.get("pe")) for r in rows]
+    inv_pb = [_inv(r.get("pb")) for r in rows]
+    roe = [r.get("roe") for r in rows]
+    div = [min(r.get("div_yield"), 8.0) if r.get("div_yield") is not None else None
+           for r in rows]
+    rev = [r.get("rev_yoy") for r in rows]
+    for i, r in enumerate(rows):
+        cheap = (_pctrank(inv_pe[i], inv_pe) + _pctrank(inv_pb[i], inv_pb)) / 2.0
+        r["score"] = 100.0 * (
+            0.50 * cheap
+            + 0.25 * _pctrank(roe[i], roe)
+            + 0.15 * _pctrank(div[i], div)
+            + 0.10 * _pctrank(rev[i], rev)
+        )
+
+
+def rank_candidates(rows: list[dict], params: dict) -> list[dict]:
+    """Score, per-industry-cap, then globally truncate the main candidates.
+
+    Groups rows by ``sector``; within each sector computes a composite cheapness/
+    quality/yield/growth score; keeps the top ``per_industry_cap`` per sector;
+    then globally sorts by score desc and truncates to ``total_cap``.
+    """
+    p = params
+    by_sector: dict[str, list[dict]] = {}
+    for r in rows:
+        by_sector.setdefault(r.get("sector") or "", []).append(r)
+
+    kept: list[dict] = []
+    for sector_rows in by_sector.values():
+        _score_sector(sector_rows)
+        sector_rows.sort(key=lambda r: r["score"], reverse=True)
+        kept.extend(sector_rows[: p["per_industry_cap"]])
+
+    kept.sort(key=lambda r: r["score"], reverse=True)
+    return kept[: p["total_cap"]]
