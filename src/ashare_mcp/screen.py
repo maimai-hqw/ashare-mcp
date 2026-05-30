@@ -137,3 +137,115 @@ def fetch_universe(page_size: int = 100, max_pages: int = 100) -> list[dict]:
             break
         page += 1
     return rows
+
+
+# ====================================================================== #
+# Task 2 — classify
+# ====================================================================== #
+# All thresholds are expressed in ANNUAL terms (roe_min=7 means 7% annual ROE).
+# Because f37 is a quarterly ROE (ROE_IS_QUARTERLY), run_screen annualizes a
+# row's roe (x4) BEFORE calling classify, so classify can compare against these
+# annual numbers directly. This keeps classify a pure function of (row, params)
+# with no hidden quarter/year coupling and makes the unit vectors read naturally.
+DEFAULTS: dict = {
+    # hard filter
+    "min_price": 3.0,           # 剔除仙股
+    "min_mktcap_yi": 50.0,      # 总市值下限(亿)
+    # non-cyclical valuation band
+    "pe_min": 4.0,
+    "pe_max": 25.0,
+    "pb_max": 2.5,              # PB cap when roe < highroe
+    "pb_max_highroe": 3.0,      # PB cap when roe >= highroe
+    "highroe": 12.0,            # 高ROE门槛(年化)
+    # ROE floors (年化)
+    "roe_min": 7.0,             # 主仓 ROE 下限
+    "roe_min_lo": 5.0,          # 低ROE救援区下限
+    "div_for_lo_roe": 3.5,      # 低ROE救援所需股息率
+    "pe_for_lo_roe": 12.0,      # 低ROE救援所需 PE 上限
+    # anomaly isolation
+    "anom_pb": 0.4,             # 破净异常阈值
+    "anom_np_yoy": 300.0,       # 业绩暴增阈值(%)
+    "anom_np_pe": 10.0,         # 业绩暴增需配合的低 PE
+    "anom_div": 10.0,           # 超高股息异常阈值(%)
+    # cyclical sectors
+    "cyc_pb_max": 1.2,
+    "cyc_div_min": 3.5,
+    "cyc_pe_min": 4.0,
+    "cyc_pe_max": 15.0,
+}
+
+# 强周期一级行业(子串匹配 EastMoney f100 一级行业名)
+CYCLICAL_SECTORS = (
+    "钢铁", "煤炭", "有色", "化工", "建材", "石油石化", "航运", "航运港口",
+)
+
+# 剔除名(ST/退市风险)子串
+_BLACKLIST_NAME = ("ST", "退")
+
+
+def _is_cyclical(sector: str) -> bool:
+    s = sector or ""
+    return any(k in s for k in CYCLICAL_SECTORS)
+
+
+def classify(row: dict, params: dict) -> str:
+    """Bucket one row into 'main' | 'anomaly' | 'reject' (pure, no network).
+
+    ``row['roe']`` is expected in ANNUAL terms (run_screen annualizes the
+    quarterly f37 before calling this). Order: hard filter -> anomaly isolation
+    -> cyclical rules -> non-cyclical rules.
+    """
+    p = params
+    name = row.get("name") or ""
+    pe = row.get("pe")
+    pb = row.get("pb")
+    price = row.get("price")
+    mktcap = row.get("mktcap_yi")
+    roe = row.get("roe")
+    div = row.get("div_yield")
+    np_yoy = row.get("np_yoy")
+    sector = row.get("sector") or ""
+
+    # --- hard filter ---------------------------------------------------
+    if any(b in name for b in _BLACKLIST_NAME):
+        return "reject"
+    if pe is None or pb is None:
+        return "reject"
+    if price is None or price < p["min_price"]:
+        return "reject"
+    if mktcap is None or mktcap < p["min_mktcap_yi"]:
+        return "reject"
+
+    # --- anomaly isolation (pull odd shapes out before normal scoring) -
+    if (0 < pe < p["pe_min"]):
+        return "anomaly"
+    if pb < p["anom_pb"]:
+        return "anomaly"
+    if (np_yoy is not None and np_yoy > p["anom_np_yoy"] and pe < p["anom_np_pe"]):
+        return "anomaly"
+    if (div is not None and div > p["anom_div"]):
+        return "anomaly"
+
+    # --- cyclical sectors: no ROE floor, but strict pb/div/pe gates -----
+    if _is_cyclical(sector):
+        if (pb <= p["cyc_pb_max"]
+                and div is not None and div >= p["cyc_div_min"]
+                and p["cyc_pe_min"] <= pe <= p["cyc_pe_max"]):
+            return "main"
+        return "reject"
+
+    # --- non-cyclical: valuation band + ROE-aware pb cap + ROE floor ----
+    if not (p["pe_min"] <= pe <= p["pe_max"]):
+        return "reject"
+    if roe is None:
+        return "reject"
+    pb_cap = p["pb_max_highroe"] if roe >= p["highroe"] else p["pb_max"]
+    if pb > pb_cap:
+        return "reject"
+    if roe >= p["roe_min"]:
+        return "main"
+    if (p["roe_min_lo"] <= roe < p["roe_min"]
+            and div is not None and div >= p["div_for_lo_roe"]
+            and pe <= p["pe_for_lo_roe"]):
+        return "main"
+    return "reject"

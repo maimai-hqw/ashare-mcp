@@ -28,3 +28,128 @@ def test_fetch_universe_returns_whole_cross_section():
     icbc = by_code.get("601398")
     assert icbc is not None
     assert icbc["pe"] is not None and 0 < icbc["pe"] < 20
+
+
+# ---------------------------------------------------------------------- #
+# _num — robustness (pure)
+# ---------------------------------------------------------------------- #
+@pytest.mark.parametrize("raw,expected", [
+    (15.21, 15.21),
+    (740, 740.0),
+    ("12.5", 12.5),
+    ("-", None),
+    ("--", None),
+    ("", None),
+    (None, None),
+    ("None", None),
+    ("abc", None),
+])
+def test_num_tolerates_bad_cells(raw, expected):
+    assert screen._num(raw) == expected
+
+
+def test_map_row_handles_missing_fields_as_none():
+    # Only a code present; every other metric absent or "-" -> None, no crash.
+    row = screen._map_row({"f12": "600000", "f9": "-", "f23": None})
+    assert row["code"] == "600000"
+    assert row["pe"] is None and row["pb"] is None and row["roe"] is None
+    assert row["name"] == "" and row["sector"] == ""
+
+
+def test_map_row_scales_price_pe_pb_and_mktcap():
+    row = screen._map_row({
+        "f12": "600519", "f14": "贵州茅台", "f2": 132600, "f9": 1521,
+        "f23": 612, "f20": 1657608202926, "f37": 10.57, "f133": 3.92,
+        "f100": "白酒",
+    })
+    assert row["price"] == 1326.0
+    assert row["pe"] == 15.21
+    assert row["pb"] == 6.12
+    assert round(row["mktcap_yi"], 0) == 16576.0
+    assert row["roe"] == 10.57  # raw quarterly f37 stored verbatim
+
+
+# ---------------------------------------------------------------------- #
+# Task 2 — classify (pure). ROE values here are in ANNUAL frame, the same
+# frame as the DEFAULTS thresholds; run_screen annualizes the quarterly f37
+# before classify sees it (see ROE_IS_QUARTERLY handling).
+# ---------------------------------------------------------------------- #
+def _row(**kw):
+    base = dict(code="000000", name="测试", price=10.0, pe=10.0, pb=1.5,
+                mktcap_yi=100.0, roe=12.0, rev_yoy=5.0, np_yoy=8.0,
+                eps=1.0, bvps=5.0, div_yield=2.0, sector="计算机")
+    base.update(kw)
+    return base
+
+
+P = screen.DEFAULTS
+
+
+def test_classify_noncyclical_quality_is_main():
+    # PE 12, PB 1.5, ROE 15 -> comfortably in the main universe.
+    assert screen.classify(_row(pe=12.0, pb=1.5, roe=15.0), P) == "main"
+
+
+def test_classify_rejects_st_name():
+    assert screen.classify(_row(name="ST康美", pe=10, pb=1.0, roe=12), P) == "reject"
+    assert screen.classify(_row(name="退市某某", pe=10, pb=1.0, roe=12), P) == "reject"
+
+
+def test_classify_rejects_missing_pe_or_pb():
+    assert screen.classify(_row(pe=None), P) == "reject"
+    assert screen.classify(_row(pb=None), P) == "reject"
+
+
+def test_classify_rejects_below_price_or_mktcap_floor():
+    assert screen.classify(_row(price=1.5), P) == "reject"
+    assert screen.classify(_row(mktcap_yi=10.0), P) == "reject"
+
+
+def test_classify_value_trap_utility_rejects():
+    # 深圳能源-style value trap: pe18 within band, pb1.08 under cap, but ROE 4.3
+    # (annual) is below the 5 hard-floor with no rescue -> reject.
+    row = _row(name="深圳能源", pe=18.0, pb=1.08, roe=4.3, div_yield=2.0,
+               sector="电力")
+    assert screen.classify(row, P) == "reject"
+
+
+def test_classify_low_roe_rescued_by_dividend_is_main():
+    # 5 <= roe < 7 but div>=3.5 and pe<=12 -> rescued into main.
+    row = _row(pe=11.0, pb=1.2, roe=6.0, div_yield=4.0, sector="食品饮料")
+    assert screen.classify(row, P) == "main"
+
+
+def test_classify_cyclical_ok_is_main():
+    # 钢铁: no ROE floor; pb<=1.2, div>=3.5, 4<=pe<=15.
+    row = _row(name="某钢铁", sector="钢铁", pe=8.0, pb=1.0, roe=3.0,
+               div_yield=4.5)
+    assert screen.classify(row, P) == "main"
+
+
+def test_classify_cyclical_violation_rejects():
+    # 煤炭 but pb too high / div too low -> reject (no ROE rescue for cyclicals).
+    assert screen.classify(_row(sector="煤炭", pe=8, pb=1.5, roe=15,
+                                div_yield=4.0), P) == "reject"
+    assert screen.classify(_row(sector="有色", pe=8, pb=1.0, roe=15,
+                                div_yield=2.0), P) == "reject"
+
+
+def test_classify_anomaly_ultra_low_pe():
+    # 0<pe<pe_min isolates as anomaly rather than reject.
+    assert screen.classify(_row(pe=1.1, pb=0.9, roe=12), P) == "anomaly"
+
+
+def test_classify_anomaly_distressed_pb():
+    assert screen.classify(_row(pe=10, pb=0.3, roe=8), P) == "anomaly"
+
+
+def test_classify_anomaly_turnaround_and_huge_yield():
+    assert screen.classify(_row(pe=8, pb=1.0, np_yoy=400, roe=10), P) == "anomaly"
+    assert screen.classify(_row(pe=10, pb=1.0, div_yield=12.0, roe=10), P) == "anomaly"
+
+
+def test_classify_noncyclical_pb_cap_depends_on_roe():
+    # roe<12 -> pb cap 2.5: pb 2.8 rejects.
+    assert screen.classify(_row(pe=15, pb=2.8, roe=10), P) == "reject"
+    # roe>=12 -> pb cap 3.0: pb 2.8 OK.
+    assert screen.classify(_row(pe=15, pb=2.8, roe=14), P) == "main"
