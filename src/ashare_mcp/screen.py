@@ -8,17 +8,26 @@ urllib), mirroring ``announcements.py``.
 EastMoney field codes (VERIFIED via live probe 2026-05-29):
   f12 code, f14 name, f2 price(*100), f9 PE-TTM(*100), f23 PB(*100),
   f20 总市值(元), f37 ROE(%), f41 营收同比(%), f46 净利同比(%), f112 EPS,
-  f113 每股净资产(BVPS), f133 股息率(%), f100 一级行业.
+  f113 每股净资产(BVPS), f133 股息率(%), f100 一级行业, f221 报告期(YYYYMMDD).
 
 SCALING (verified): f2/f9/f23 are integer-scaled by 100 (price 1326.00 -> 132600,
 PE 15.21 -> 1521, PB 6.12 -> 612). f20 is raw 元 (-> /1e8 for 亿). f37/f41/f46/
 f112/f113/f133 are already plain numbers.
 
-ROE CALIBRATION (verified 2026-05-29): f37 is the LATEST SINGLE-QUARTER ROE, not
-annual/TTM. Big banks printed f37 ~2.2-3.4 (工行 2.21, 招行 3.37, 农行 2.65) whose
-*annual* ROE is ~10-14%; 贵州茅台 printed 10.57 vs ~30%+ annual. So f37 ≈ annual/4.
-=> ROE_IS_QUARTERLY = True, and every ROE threshold below (expressed as an annual
-figure for readability) is divided by 4 (``_roe_floor``) before comparing to f37.
+ROE CALIBRATION (verified 2026-05-29): f37 is the LATEST CUMULATIVE (YTD) ROE for
+the most recent report period — NOT a single quarter. Proven by EPS(f112)/BVPS(
+f113) reproducing f37: 茅台 21.79/216.32 = 10.07% ≈ f37 10.57; 工行 0.2439/11.06 =
+2.21% ≈ f37 2.21. Because it is *cumulative* over the period, an annualization
+factor depends on how many months the period spans (Q1 YTD = 3mo -> x4, H1 = 6mo
+-> x2, Q3 = 9mo -> x4/3, annual = 12mo -> x1).
+
+ANNUALIZATION: each row carries its own report period in f221 (a YYYYMMDD report
+date, e.g. 20260331 for a Q1 report). run_screen derives a per-row period-aware
+factor via ``_annual_factor`` and multiplies the raw f37 by it BEFORE classify, so
+classify compares an annualized ROE against the plain ANNUAL thresholds in
+DEFAULTS directly. The raw per-period f37 is preserved under ``roe_q`` and the
+annualized estimate under ``roe``. When f221 is absent/unreliable (==0) the factor
+falls back to one inferred from today's calendar (see ``_annual_factor`` doc).
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ from __future__ import annotations
 import json
 import urllib.parse
 import urllib.request
+from datetime import date, datetime
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -36,11 +46,7 @@ _HEADERS = {"User-Agent": _UA, "Referer": "https://quote.eastmoney.com/"}
 _CLIST_API = "https://push2delay.eastmoney.com/api/qt/clist/get"
 # m:0+t:6 深主板, m:0+t:80 创业板, m:1+t:2 沪主板, m:1+t:23 科创板
 _MARKET_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-_FIELDS = "f12,f14,f2,f9,f23,f20,f37,f41,f46,f112,f113,f133,f100"
-
-# f37 is a quarterly ROE (see module docstring). Annual ROE thresholds in
-# DEFAULTS are divided by 4 before comparing to f37.
-ROE_IS_QUARTERLY = True
+_FIELDS = "f12,f14,f2,f9,f23,f20,f37,f41,f46,f112,f113,f133,f100,f221"
 
 
 def _num(v) -> float | None:
@@ -68,6 +74,63 @@ def _scaled(v, factor: float) -> float | None:
     return None if n is None else n / factor
 
 
+# Months-of-period -> annualization factor (12 / months). f37 is a CUMULATIVE
+# YTD ROE, so a Q1 (3-month) figure annualizes x4, H1 (6mo) x2, Q3 (9mo) x4/3,
+# annual (12mo) x1.
+_MONTHS_FACTOR = {3: 4.0, 6: 2.0, 9: 4.0 / 3.0, 12: 1.0}
+
+
+def _annual_factor(report_period=None, today: date | None = None) -> float:
+    """Factor to annualize a cumulative-YTD f37 ROE for a single report period.
+
+    Preferred: pass ``report_period`` (the per-row f221) as a YYYYMMDD string/int
+    (the period end-date, e.g. ``"20260630"`` -> H1 -> 2.0) or as an int
+    month-of-period in {3,6,9,12}. The period's month determines the span:
+    Q1->4.0, H1->2.0, Q3->4/3, annual->1.0.
+
+    Fallback (no usable report_period): infer the period from ``today`` using the
+    A-share mandatory-disclosure calendar (年报&一季报 by Apr 30; 半年报 by Aug 31;
+    三季报 by Oct 31):
+      May 1 – Aug 31 -> Q1 reflected -> 4.0
+      Sep 1 – Oct 31 -> H1 reflected -> 2.0
+      Nov 1 – Dec 31 -> Q3 reflected -> 4/3
+      Jan 1 – Apr 30 -> transition (most names still prior-year Q3 until they file
+                        the annual report) -> 1.0.
+    The Jan–Apr branch deliberately assumes the *annual* report (factor 1.0) even
+    though many names are still on Q3: deflating a still-Q3 name's ROE risks a
+    FALSE NEGATIVE (it drops out of the screen), which is the safe failure mode
+    for a conservative value screen — far better than inflating a value trap by
+    a Q3 x4/3 and letting it in. Per-row f221 avoids this guess entirely when
+    available, which is why it is preferred over the calendar fallback.
+    """
+    months = None
+    if report_period is not None:
+        n = _num(report_period)
+        if n is not None and n > 0:
+            n = int(n)
+            if n in _MONTHS_FACTOR:          # already a month-of-period (3/6/9/12)
+                months = n
+            elif n >= 10000:                  # YYYYMMDD -> take the month
+                months = (n // 100) % 100
+    if months in _MONTHS_FACTOR:
+        return _MONTHS_FACTOR[months]
+    if months is not None:
+        # Non-quarter-end month (unexpected); annualize by elapsed months, clamped.
+        m = months if 1 <= months <= 12 else 12
+        return 12.0 / m
+
+    d = today or datetime.now().date()
+    md = (d.month, d.day)
+    if (5, 1) <= md <= (8, 31):
+        return 4.0
+    if (9, 1) <= md <= (10, 31):
+        return 2.0
+    if (11, 1) <= md <= (12, 31):
+        return 4.0 / 3.0
+    # Jan 1 – Apr 30 transition window: assume annual already filed (see docstring).
+    return 1.0
+
+
 def _map_row(d: dict) -> dict | None:
     """Map one EastMoney clist record into a screen row dict, or None if it has
     no usable code (defensive against malformed rows)."""
@@ -84,10 +147,15 @@ def _map_row(d: dict) -> dict | None:
         "roe": _num(d.get("f37")),
         "rev_yoy": _num(d.get("f41")),
         "np_yoy": _num(d.get("f46")),
+        # eps (f112) and bvps (f113) are surfaced for downstream human /
+        # deep-analysis inspection only — they feed no filter and no score.
         "eps": _num(d.get("f112")),
         "bvps": _num(d.get("f113")),
         "div_yield": _num(d.get("f133")),
         "sector": (d.get("f100") or "").strip(),
+        # f221 报告期 (YYYYMMDD report date, e.g. 20260331); 0/absent if unknown.
+        # Drives the per-row period-aware ROE annualization in run_screen.
+        "report_period": _num(d.get("f221")),
     }
 
 
@@ -143,10 +211,10 @@ def fetch_universe(page_size: int = 100, max_pages: int = 100) -> list[dict]:
 # Task 2 — classify
 # ====================================================================== #
 # All thresholds are expressed in ANNUAL terms (roe_min=7 means 7% annual ROE).
-# Because f37 is a quarterly ROE (ROE_IS_QUARTERLY), run_screen annualizes a
-# row's roe (x4) BEFORE calling classify, so classify can compare against these
-# annual numbers directly. This keeps classify a pure function of (row, params)
-# with no hidden quarter/year coupling and makes the unit vectors read naturally.
+# f37 is a cumulative-YTD ROE, so run_screen annualizes a row's roe by a
+# period-aware factor (_annual_factor) BEFORE calling classify — classify then
+# compares the annualized ROE against these plain annual numbers directly. This
+# keeps classify a pure function of (row, params) with no hidden period coupling.
 DEFAULTS: dict = {
     # hard filter
     "min_price": 3.0,           # 剔除仙股
@@ -177,9 +245,10 @@ DEFAULTS: dict = {
     "total_cap": 120,
 }
 
-# 强周期一级行业(子串匹配 EastMoney f100 一级行业名)
+# 强周期一级行业(子串匹配 EastMoney f100 一级行业名)。
+# 注:"航运" 子串已覆盖东财长名 "航运港口",故不单列后者(避免冗余匹配项)。
 CYCLICAL_SECTORS = (
-    "钢铁", "煤炭", "有色", "化工", "建材", "石油石化", "航运", "航运港口",
+    "钢铁", "煤炭", "有色", "化工", "建材", "石油石化", "航运",
 )
 
 # 剔除名(ST/退市风险)子串
@@ -310,6 +379,10 @@ def rank_candidates(rows: list[dict], params: dict) -> list[dict]:
     then globally sorts by score desc and truncates to ``total_cap``.
     """
     p = params
+    # Coerce caps to int: run_screen does not coerce overrides, and a float cap
+    # passed via a direct Python call would raise on list slicing.
+    per_industry_cap = int(p["per_industry_cap"])
+    total_cap = int(p["total_cap"])
     by_sector: dict[str, list[dict]] = {}
     for r in rows:
         by_sector.setdefault(r.get("sector") or "", []).append(r)
@@ -318,25 +391,31 @@ def rank_candidates(rows: list[dict], params: dict) -> list[dict]:
     for sector_rows in by_sector.values():
         _score_sector(sector_rows)
         sector_rows.sort(key=lambda r: r["score"], reverse=True)
-        kept.extend(sector_rows[: p["per_industry_cap"]])
+        kept.extend(sector_rows[:per_industry_cap])
 
     kept.sort(key=lambda r: r["score"], reverse=True)
-    return kept[: p["total_cap"]]
+    return kept[:total_cap]
 
 
 # ====================================================================== #
 # Task 4 — run_screen (orchestration)
 # ====================================================================== #
-def _annualize_roe(row: dict) -> dict:
+def _annualize_roe(row: dict, today: date | None = None) -> dict:
     """Return a shallow copy of ``row`` with ``roe`` converted from the raw
-    quarterly f37 to an annual-equivalent (x4) when ROE_IS_QUARTERLY, so it can
-    be compared against the annual thresholds in DEFAULTS. The raw quarterly
-    figure is preserved under ``roe_q`` for transparency."""
+    cumulative-YTD f37 to an annual-equivalent, so it can be compared against the
+    annual thresholds in DEFAULTS.
+
+    The factor is period-aware (``_annual_factor``): preferred from the row's own
+    ``report_period`` (f221); when that is absent/0 it falls back to a factor
+    inferred from ``today`` (default: now). The raw per-period figure is preserved
+    under ``roe_q`` for transparency; the annualized estimate is ``roe``.
+    """
     out = dict(row)
     q = row.get("roe")
     out["roe_q"] = q
-    if ROE_IS_QUARTERLY and q is not None:
-        out["roe"] = q * 4.0
+    if q is not None:
+        factor = _annual_factor(report_period=row.get("report_period"), today=today)
+        out["roe"] = q * factor
     return out
 
 
@@ -362,6 +441,11 @@ def run_screen(**overrides) -> dict:
             anomaly_pool.append(r)
 
     candidates = rank_candidates(main_rows, params)
+    # Each candidate / anomaly dict carries:
+    #   RAW (from EastMoney): code, name, price, pe, pb, mktcap_yi, rev_yoy,
+    #     np_yoy, eps, bvps, div_yield, sector, report_period, roe_q (原始单期/YTD f37).
+    #   DERIVED (computed here): roe (年化估计 = roe_q × _annual_factor),
+    #     score (0..100 composite, candidates only).
     return {
         "candidates": candidates,
         "anomaly_pool": anomaly_pool,

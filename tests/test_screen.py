@@ -4,6 +4,8 @@ Network tests (marked) hit EastMoney's clist API live; pure tests cover the
 classify / rank / run_screen logic and the _num parser with no network.
 """
 
+from datetime import date
+
 import pytest
 
 from ashare_mcp import screen
@@ -66,13 +68,57 @@ def test_map_row_scales_price_pe_pb_and_mktcap():
     assert row["pe"] == 15.21
     assert row["pb"] == 6.12
     assert round(row["mktcap_yi"], 0) == 16576.0
-    assert row["roe"] == 10.57  # raw quarterly f37 stored verbatim
+    assert row["roe"] == 10.57  # raw cumulative-YTD f37 stored verbatim
+
+
+# ---------------------------------------------------------------------- #
+# _annual_factor — period-aware ROE annualization (pure)
+# ---------------------------------------------------------------------- #
+def test_annual_factor_from_calendar_season():
+    # Today (2026-05-29) is in the May 1 – Aug 31 window -> latest report is Q1
+    # (3-month YTD) -> x4.
+    assert screen._annual_factor(today=date(2026, 6, 15)) == 4.0
+    assert screen._annual_factor(today=date(2026, 8, 15)) == 4.0
+    # Sep 1 – Oct 31 -> H1 (6mo) -> x2.
+    assert screen._annual_factor(today=date(2026, 9, 15)) == 2.0
+    # Nov 1 – Dec 31 -> Q3 (9mo) -> x4/3.
+    assert screen._annual_factor(today=date(2026, 11, 15)) == pytest.approx(4.0 / 3.0)
+    # Jan 1 – Apr 30 transition -> assume annual already filed -> x1.
+    assert screen._annual_factor(today=date(2026, 2, 15)) == 1.0
+
+
+def test_annual_factor_from_report_period():
+    # Per-row f221 (YYYYMMDD report date) overrides the calendar guess.
+    assert screen._annual_factor(report_period="20260331") == 4.0   # Q1
+    assert screen._annual_factor(report_period="20260630") == 2.0   # H1
+    assert screen._annual_factor(report_period=20260630) == 2.0      # int form
+    assert screen._annual_factor(report_period="20250930") == pytest.approx(4.0 / 3.0)
+    assert screen._annual_factor(report_period="20251231") == 1.0    # annual
+    # month-of-period int form
+    assert screen._annual_factor(report_period=6) == 2.0
+    # absent/0 report period -> falls back to the calendar
+    assert screen._annual_factor(report_period=0, today=date(2026, 6, 15)) == 4.0
+    assert screen._annual_factor(report_period=None, today=date(2026, 9, 15)) == 2.0
+
+
+def test_annualize_roe_uses_per_row_period():
+    # raw cumulative f37 of 3.0 on a Q1 report (f221=20260331) -> x4 -> 12.0.
+    out = screen._annualize_roe(_row(roe=3.0, report_period=20260331.0))
+    assert out["roe_q"] == 3.0
+    assert out["roe"] == pytest.approx(12.0)
+    # an H1 report (f221=20260630) annualizes the same 3.0 only x2 -> 6.0.
+    out2 = screen._annualize_roe(_row(roe=3.0, report_period=20260630.0))
+    assert out2["roe"] == pytest.approx(6.0)
+    # missing report_period -> falls back to today's calendar factor.
+    out3 = screen._annualize_roe(_row(roe=3.0, report_period=None),
+                                 today=date(2026, 6, 15))
+    assert out3["roe"] == pytest.approx(12.0)
 
 
 # ---------------------------------------------------------------------- #
 # Task 2 — classify (pure). ROE values here are in ANNUAL frame, the same
-# frame as the DEFAULTS thresholds; run_screen annualizes the quarterly f37
-# before classify sees it (see ROE_IS_QUARTERLY handling).
+# frame as the DEFAULTS thresholds; run_screen annualizes the cumulative-YTD
+# f37 by a period-aware factor before classify sees it (see _annual_factor).
 # ---------------------------------------------------------------------- #
 def _row(**kw):
     base = dict(code="000000", name="测试", price=10.0, pe=10.0, pb=1.5,
@@ -106,11 +152,29 @@ def test_classify_rejects_below_price_or_mktcap_floor():
 
 
 def test_classify_value_trap_utility_rejects():
-    # 深圳能源-style value trap: pe18 within band, pb1.08 under cap, but ROE 4.3
-    # (annual) is below the 5 hard-floor with no rescue -> reject.
-    row = _row(name="深圳能源", pe=18.0, pb=1.08, roe=4.3, div_yield=2.0,
-               sector="电力")
-    assert screen.classify(row, P) == "reject"
+    # Exercise the REAL annualize->classify chain (no hard-coded pre-annualized
+    # roe). A utility with a weak raw period ROE that, even after the period-aware
+    # factor, lands below the roe_min floor with no dividend rescue -> reject.
+    # raw f37 1.0 on a Q3 report (f221=20250930) -> x4/3 -> ~1.33 annual << 7.
+    raw = _row(name="某公用事业", pe=18.0, pb=1.08, roe=1.0, div_yield=2.0,
+               sector="电力", report_period=20250930.0)
+    annualized = screen._annualize_roe(raw)
+    assert annualized["roe"] == pytest.approx(4.0 / 3.0)
+    assert screen.classify(annualized, P) == "reject"
+
+
+def test_classify_strong_single_period_passes_known_ttm_limitation():
+    # KNOWN coarse-screen limitation: single-period ROE x factor cannot detect
+    # seasonality / TTM value traps. A non-cyclical name with a strong single
+    # quarter (深圳能源-like Q1: raw f37 3.54 on f221=20260331 -> x4 -> ~14.2
+    # annual) classifies as 'main' even though its TTM ROE may reveal a value
+    # trap. The deep-analysis stage ⑤ re-derives TTM ROE to catch these; this
+    # test documents the limitation explicitly rather than hiding it.
+    raw = _row(name="深圳能源", pe=18.0, pb=1.08, roe=3.54, div_yield=2.0,
+               sector="电力", report_period=20260331.0)
+    annualized = screen._annualize_roe(raw)
+    assert annualized["roe"] == pytest.approx(14.16)
+    assert screen.classify(annualized, P) == "main"
 
 
 def test_classify_low_roe_rescued_by_dividend_is_main():
@@ -205,24 +269,45 @@ def test_rank_truncates_total_cap():
     assert scores == sorted(scores, reverse=True)
 
 
+def test_rank_coerces_float_caps_without_crashing():
+    # R8: float caps (e.g. from a direct Python call) must not raise on slicing.
+    rows = []
+    for i in range(10):
+        rows.append(_row(code=f"{700000 + i}", sector="计算机",
+                         pe=5.0 + i, pb=1.5, roe=12.0, div_yield=2.0,
+                         rev_yoy=5.0))
+    params = dict(P)
+    params["per_industry_cap"] = 3.0
+    params["total_cap"] = 3.0
+    out = screen.rank_candidates(rows, params)
+    assert len(out) == 3
+    # cheapest survive and order is preserved
+    assert out[0]["pe"] == 5.0
+
+
 # ---------------------------------------------------------------------- #
 # Task 4 — run_screen (pure, fetch_universe monkeypatched)
 # ---------------------------------------------------------------------- #
 def test_run_screen_splits_main_and_anomaly(monkeypatch):
-    # roe here is RAW QUARTERLY f37 (run_screen annualizes x4 before classify).
+    # roe here is RAW per-period f37; with f221=20260331 (Q1) run_screen
+    # annualizes x4 before classify (pinned so the test is date-independent).
     fake = [
         # main: annual roe 12, in band, big enough
         _row(code="600001", name="优质龙头", sector="计算机", pe=10.0,
-             pb=1.2, roe=3.0, div_yield=2.0, price=10.0, mktcap_yi=100.0),
+             pb=1.2, roe=3.0, div_yield=2.0, price=10.0, mktcap_yi=100.0,
+             report_period=20260331.0),
         # anomaly: ultra-low PE
         _row(code="600002", name="超低市盈", sector="机械", pe=1.1,
-             pb=0.9, roe=3.0, div_yield=1.0, price=8.0, mktcap_yi=80.0),
+             pb=0.9, roe=3.0, div_yield=1.0, price=8.0, mktcap_yi=80.0,
+             report_period=20260331.0),
         # reject: ST name
         _row(code="600003", name="ST困境", sector="计算机", pe=10.0,
-             pb=1.0, roe=3.0, div_yield=2.0, price=6.0, mktcap_yi=60.0),
+             pb=1.0, roe=3.0, div_yield=2.0, price=6.0, mktcap_yi=60.0,
+             report_period=20260331.0),
         # anomaly: 超高股息
         _row(code="600004", name="高股息", sector="银行", pe=8.0,
-             pb=1.0, roe=3.0, div_yield=12.0, price=5.0, mktcap_yi=200.0),
+             pb=1.0, roe=3.0, div_yield=12.0, price=5.0, mktcap_yi=200.0,
+             report_period=20260331.0),
     ]
     monkeypatch.setattr(screen, "fetch_universe", lambda *a, **k: list(fake))
     out = screen.run_screen()
